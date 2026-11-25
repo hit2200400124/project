@@ -11,9 +11,10 @@ import torch
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.utils.data
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
 from dataset.abstract_dataset import DeepfakeAbstractBaseDataset
-from model.ds import DS
+from model.ds import DS, moe_route_metrics
 
 import argparse
 
@@ -68,6 +69,7 @@ def choose_metric(config):
 def test_one_dataset(model, data_loader):
     device = next(model.parameters()).device
     predictions, labels, reference_rates = [], [], []
+    route_weights = []
     for data_dict in tqdm(data_loader, total=len(data_loader)):
         data_dict['label'] = (data_dict['label'] != 0).long()
         data_dict = {
@@ -79,8 +81,11 @@ def test_one_dataset(model, data_loader):
         predictions.extend(result['prob'].cpu().tolist())
         if 'frequency_reference_used' in result:
             reference_rates.extend(result['frequency_reference_used'].float().mean(dim=1).cpu().tolist())
+        if 'moe_route_weights' in result:
+            route_weights.append(result['moe_route_weights'].cpu())
 
-    return np.asarray(predictions), np.asarray(labels), np.asarray(reference_rates)
+    route_metrics = moe_route_metrics(torch.cat(route_weights)) if route_weights else {}
+    return np.asarray(predictions), np.asarray(labels), np.asarray(reference_rates), route_metrics
     
 def test_epoch(model, test_data_loaders):
     # set model to eval mode
@@ -94,11 +99,12 @@ def test_epoch(model, test_data_loaders):
     for key in keys:
         data_dict = test_data_loaders[key].dataset.data_dict
         # compute loss for each dataset
-        predictions_nps, label_nps, reference_rates = test_one_dataset(model, test_data_loaders[key])
+        predictions_nps, label_nps, reference_rates, route_metrics = test_one_dataset(model, test_data_loaders[key])
         print(f'name {data_dict.keys()}')
         # compute metric for each dataset
         metric_one_dataset = get_test_metrics(y_pred=predictions_nps, y_true=label_nps,
                                               img_names=data_dict['image'])
+        metric_one_dataset.update(route_metrics)
         if reference_rates.size:
             metric_one_dataset['frequency_reference_rate'] = float(reference_rates.mean())
             for label, name in ((0, 'real'), (1, 'fake')):
@@ -148,10 +154,16 @@ def main():
                head_num=config['head_num'],
                device=device,
                frequency_fusion=frequency_mode,
-               clip_download_root=config.get('clip_download_root')).to(device)
+               clip_download_root=config.get('clip_download_root'),
+               conv_moe_mode=config.get('conv_moe_mode') or 'off',
+               conv_moe_top_k=config.get('conv_moe_top_k', 1)).to(device)
 
     ckpt = torch.load(weights_path, map_location=device)
+    if ckpt and all(key.startswith('module.') for key in ckpt):
+        consume_prefix_in_state_dict_if_present(ckpt, 'module.')
     incompatible = model.load_state_dict(ckpt, strict=frequency_mode != 'off')
+    if any(key.startswith('adapter.conv_moe.') for key in incompatible.missing_keys):
+        raise RuntimeError('Checkpoint lacks weights for the configured convolutional MoE.')
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(f'Checkpoint key mismatch: {incompatible}')
     print(f'===> Load {weights_path} done!')

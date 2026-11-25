@@ -104,7 +104,8 @@ python train.py --config_path config/train.yaml
 ```
 
 ## 🧪 Testing
-Set the dataset paths, device, and the same `frequency_fusion` mode as the training run in `config/test.yaml`.
+Set the dataset paths and device in `config/test.yaml`. Use the `frequency_fusion`,
+`conv_moe_mode`, and `conv_moe_top_k` values from the training run.
 
 ```bash
 python test.py --detector_path config/test.yaml --weights_path /path/to/ckpt_best.pth
@@ -130,6 +131,24 @@ window have predicted coverage at most 0.2. Evaluation reports the proportion of
 active reference, including separate rates for real and fake frames.
 Train each mode from scratch for controlled comparisons. The CLIP feature projections are registered
 in this version, so older detector checkpoints lack those learned projection weights.
+
+## Convolutional MoE experiments
+
+| `conv_moe_mode` | Placement |
+| --- | --- |
+| `off` | Uses the existing Adapter and supports checkpoints trained without MoE. |
+| `post_fusion` | Adds the MoE residual after block 3 and its CLIP fusion. DCT and MoE both read the same fused visual tokens when enabled together. |
+| `ffn` | Adds the MoE residual to visual tokens alongside the block 4 MLP after self-attention. |
+
+Both MoE placements use a shared convolution and route each image to CDC, ADC, or RDC. The
+default `conv_moe_top_k: 1` selects one expert with its probability from the full router softmax.
+Set `conv_moe_top_k: 2` to select two experts and normalize their weights over the selected pair.
+`conv_moe_balance_weight` controls the routing loss during training. Evaluation reports each
+expert's selection rate and mean weight across frames.
+
+For the placement comparison, train `off`, `post_fusion`, and `ffn` runs with
+`frequency_fusion: 'off'` and matching seeds and training schedules. To train the joint model,
+set `conv_moe_mode: 'ffn'` and `frequency_fusion: 'guided'`.
 
 ## 📝 Citation
 

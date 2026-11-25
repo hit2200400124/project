@@ -3,6 +3,7 @@ from torch import nn
 from timm import create_model
 from torch.nn import functional as F
 
+from model.adapters.conv_moe import ConvMoE
 from model.adapters.frequency import FrequencyFusion
 from model.layer import Fusion, MLP, PatchEmbed, VT_LN
 from functools import partial
@@ -38,8 +39,11 @@ class Mask_Decoder(nn.Module):
 
 class Adapter(nn.Module):
     def __init__(self, vit_name, num_quires, fusion_map, mlp_dim, mlp_out_dim, head_num, device,
-                 clip_dim, frequency_fusion="off"):
+                 clip_dim, frequency_fusion="off", conv_moe_mode="off", conv_moe_top_k=1):
         super().__init__()
+        if conv_moe_mode not in ("off", "post_fusion", "ffn"):
+            raise ValueError(f"Invalid conv_moe_mode: {conv_moe_mode!r}. Expected off, post_fusion, or ffn.")
+        self.conv_moe_mode = conv_moe_mode
         self.device = device
         self.vit_model = create_model(vit_name,
                                       pretrained=False,
@@ -74,6 +78,11 @@ class Adapter(nn.Module):
             FrequencyFusion(self.num_features, frequency_fusion)
             if frequency_fusion and frequency_fusion != "off" else None
         )
+        self.conv_moe = None
+        if self.conv_moe_mode != "off":
+            # Keep the initialization of later layers aligned across the ablations.
+            with torch.random.fork_rng(devices=[]):
+                self.conv_moe = ConvMoE(self.num_features, top_k=conv_moe_top_k)
 
     def fuse(self, block_idx, x, clip_features, spatial_shape):
         if str(block_idx) not in self.clip_fusions:
@@ -84,6 +93,29 @@ class Adapter(nn.Module):
             x[:, -patch_count:], clip_features[clip_layer], spatial_shape
         )
         return torch.cat((x[:, :-patch_count], fused_patch), dim=1)
+
+    def _forward_with_moe_ffn(self, block, x, spatial_shape):
+        attention = block.attn(block.norm1(x))
+        if hasattr(block, "ls1"):
+            attention = block.ls1(attention)
+        if hasattr(block, "drop_path1"):
+            x = x + block.drop_path1(attention)
+        else:
+            x = x + block.drop_path(attention)
+
+        normalized = block.norm2(x)
+        mlp = block.mlp(normalized)
+        if hasattr(block, "ls2"):
+            mlp = block.ls2(mlp)
+        if hasattr(block, "drop_path2"):
+            x = x + block.drop_path2(mlp)
+        else:
+            x = x + block.drop_path(mlp)
+
+        patch_count = spatial_shape[0] * spatial_shape[1]
+        delta, balance, weights = self.conv_moe(normalized[:, -patch_count:], spatial_shape)
+        visual = x[:, -patch_count:] + delta
+        return torch.cat((x[:, :-patch_count], visual), dim=1), balance, weights
 
     def intra_contra(self, block_idx, x, patch_labels, image_labels, spatial_shape):
         loss = 0
@@ -147,19 +179,28 @@ class Adapter(nn.Module):
         outs = []
         out_layers = [8]
         loss_intra = 0
-        frequency_outputs = {}
+        aux_outputs = {}
         for i, block in enumerate(self.vit_model.blocks, start=1):  # total 1-12 ,only use 1-8
-            x = block(x)  # (N, Q_L+L, D)
+            if i == 4 and self.conv_moe_mode == "ffn":
+                x, balance, weights = self._forward_with_moe_ffn(block, x, (h, w))
+                aux_outputs.update(moe_balance=balance, moe_route_weights=weights)
+            else:
+                x = block(x)  # (N, Q_L+L, D)
             x = self.fuse(i, x, clip_features, (h, w))
-            if i == 3 and self.frequency_fusion is not None:
-                visual, coverage_logits, reference_used = self.frequency_fusion(
-                    x[:, -v_L:], data_dict.get("luma"), (h, w)
-                )
+            if i == 3 and (self.frequency_fusion is not None or self.conv_moe_mode == "post_fusion"):
+                fused_visual = x[:, -v_L:]
+                visual = fused_visual
+                if self.frequency_fusion is not None:
+                    visual, coverage_logits, reference_used = self.frequency_fusion(
+                        fused_visual, data_dict.get("luma"), (h, w)
+                    )
+                    aux_outputs.update(coverage_logits=coverage_logits, frequency_reference_used=reference_used)
+                if self.conv_moe_mode == "post_fusion":
+                    normalized = F.layer_norm(fused_visual, (self.num_features,))
+                    delta, balance, weights = self.conv_moe(normalized, (h, w))
+                    visual = visual + delta
+                    aux_outputs.update(moe_balance=balance, moe_route_weights=weights)
                 x = torch.cat((x[:, :-v_L], visual), dim=1)
-                frequency_outputs = {
-                    "coverage_logits": coverage_logits,
-                    "frequency_reference_used": reference_used,
-                }
             if not inference and data_dict.get('patch_label') is not None:
                 loss_intra = loss_intra + self.intra_contra(
                     i, x, data_dict['patch_label'], data_dict['label'], (h, w)
@@ -185,4 +226,4 @@ class Adapter(nn.Module):
             xray_preds.append(xray_pred)
             attn_biases.append(attn_bias)
 
-        return attn_biases, xray_preds, loss_intra, frequency_outputs
+        return attn_biases, xray_preds, loss_intra, aux_outputs

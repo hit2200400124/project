@@ -4,11 +4,21 @@ from torch import nn
 from model.clip.clip import load
 import torch
 from model.adapters.adapter import Adapter
+from model.adapters.conv_moe import ConvMoE
 from model.adapters.frequency import FrequencyFusion
 from .attn import RecAttnClip
 from .layer import PostClipProcess, MaskPostXrayProcess
 import torch.nn.functional as F
 from trainer.metrics.base_metrics_class import calculate_metrics_for_train
+
+
+def moe_route_metrics(weights):
+    rates, mean_weights = torch.stack(((weights > 0).float().mean(dim=0), weights.mean(dim=0))).tolist()
+    metrics = {}
+    for expert, rate, weight in zip(ConvMoE.expert_names, rates, mean_weights):
+        metrics[f'moe_{expert}_rate'] = rate
+        metrics[f'moe_{expert}_weight'] = weight
+    return metrics
 
 
 class DS(nn.Module):
@@ -22,13 +32,18 @@ class DS(nn.Module):
                  device,
                  mode='video',
                  frequency_fusion="off",
-                 clip_download_root=None):
+                 clip_download_root=None,
+                 conv_moe_mode="off",
+                 conv_moe_balance_weight=0.01,
+                 conv_moe_top_k=1):
         super().__init__()
         self.device = device
+        self.conv_moe_balance_weight = conv_moe_balance_weight
         self.clip_model, self.processor = load(clip_name, device=device, download_root=clip_download_root)
         self.adapter = Adapter(vit_name=adapter_vit_name, num_quires=num_quires, fusion_map=fusion_map, mlp_dim=mlp_dim,
                                mlp_out_dim=mlp_out_dim, head_num=head_num, device=self.device,
-                               clip_dim=self.clip_model.visual.width, frequency_fusion=frequency_fusion)
+                               clip_dim=self.clip_model.visual.width, frequency_fusion=frequency_fusion,
+                               conv_moe_mode=conv_moe_mode, conv_moe_top_k=conv_moe_top_k)
         self.rec_attn_clip = RecAttnClip(self.clip_model.visual, num_quires,device=self.device)  # 全部参数被冻结
         self.masked_xray_post_process = MaskPostXrayProcess(in_c=num_quires).to(self.device)
         self.clip_post_process = PostClipProcess(num_quires=num_quires, embed_dim=768)
@@ -65,6 +80,9 @@ class DS(nn.Module):
             )
             loss_dict['coverage'] = loss_coverage
             loss_dict['overall'] = loss_dict['overall'] + loss_coverage
+        if 'moe_balance' in pred_dict:
+            loss_dict['moe_balance'] = pred_dict['moe_balance']
+            loss_dict['overall'] = loss_dict['overall'] + self.conv_moe_balance_weight * loss_dict['moe_balance']
         return loss_dict
 
     def get_train_metrics(self, data_dict, pred_dict):
@@ -72,6 +90,8 @@ class DS(nn.Module):
         pred = pred_dict['cls']
         auc, eer, acc, ap = calculate_metrics_for_train(label.detach(), pred.detach())
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
+        if 'moe_route_weights' in pred_dict:
+            metric_batch_dict.update(moe_route_metrics(pred_dict['moe_route_weights']))
         return metric_batch_dict
 
     def get_test_metrics(self):
@@ -101,7 +121,7 @@ class DS(nn.Module):
             align_corners=False,
         )
         clip_features = self.clip_model.extract_features(clip_images, self.adapter.fusion_map.values())
-        attn_biases, xray_preds, loss_adapter_intra, frequency_outputs = self.adapter(
+        attn_biases, xray_preds, loss_adapter_intra, adapter_outputs = self.adapter(
             data_dict, clip_features, inference
         )
         clip_output, loss_clip = self.rec_attn_clip(
@@ -120,7 +140,7 @@ class DS(nn.Module):
             'xray_pred': xray_pred,
             'loss_intra': loss_adapter_intra,
             'loss_clip': loss_clip,
-            **frequency_outputs,
+            **adapter_outputs,
         }
 
         if inference and data_dict.get('label') is not None:

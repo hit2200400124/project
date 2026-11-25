@@ -223,7 +223,10 @@ def main():
            head_num=config['head_num'],
            device=device,
            frequency_fusion=config.get('frequency_fusion', 'off'),
-           clip_download_root=config.get('clip_download_root'))
+           clip_download_root=config.get('clip_download_root'),
+           conv_moe_mode=config.get('conv_moe_mode') or 'off',
+           conv_moe_balance_weight=config.get('conv_moe_balance_weight', 0.01),
+           conv_moe_top_k=config.get('conv_moe_top_k', 1))
 
 
     # prepare the optimizer
