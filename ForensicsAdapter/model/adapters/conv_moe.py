@@ -40,12 +40,19 @@ class ConvMoE(nn.Module):
 
     expert_names = ("cdc", "adc", "rdc")
 
-    def __init__(self, channels, hidden_dim=16, top_k=1):
+    def __init__(self, channels, hidden_dim=16, top_k=1, *, pixel_patch_size=None):
         super().__init__()
         if type(top_k) is not int or top_k not in (1, 2):
             raise ValueError(f"Invalid ConvMoE top_k: {top_k!r}. Expected integer 1 or 2.")
+        if pixel_patch_size is not None:
+            if type(pixel_patch_size) is not int or pixel_patch_size < 1:
+                raise ValueError(f"Invalid ConvMoE pixel patch size: {pixel_patch_size!r}.")
+            if top_k != 1:
+                raise ValueError("Pixel ConvMoE requires top_k=1.")
         self.top_k = top_k
-        self.down = nn.Conv2d(channels, hidden_dim, kernel_size=1)
+        self.pixel_patch_size = pixel_patch_size
+        input_channels = channels if pixel_patch_size is None else 3
+        self.down = nn.Conv2d(input_channels, hidden_dim, kernel_size=1)
         self.shared_expert = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
         self.experts = nn.ModuleList(
             _DifferenceConv2d(hidden_dim, operator) for operator in self.expert_names
@@ -55,13 +62,7 @@ class ConvMoE(nn.Module):
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
-    def forward(self, spatial_tokens, spatial_shape):
-        height, width = spatial_shape
-        batch, patch_count, channels = spatial_tokens.shape
-        if min(batch, height, width) < 1 or patch_count != height * width:
-            raise ValueError(f"Visual token shape {spatial_tokens.shape} does not match grid {spatial_shape}")
-
-        grid = spatial_tokens.transpose(1, 2).reshape(batch, channels, height, width)
+    def _mix_experts(self, grid):
         features = self.down(grid)
         with torch.autocast(device_type=features.device.type, enabled=False):
             values = features.float()
@@ -71,8 +72,6 @@ class ConvMoE(nn.Module):
             descriptor = torch.cat((global_mean, local_deviation), dim=1)
             logits = F.linear(descriptor, self.router.weight.float(), self.router.bias.float())
             probabilities = logits.softmax(dim=1)
-            importance = probabilities.mean(dim=0)
-            balance_loss = (len(self.experts) * importance - 1).square().mean()
             selected_logits, selected = logits.topk(self.top_k, dim=1)
             if self.top_k == 1:
                 # The full-softmax score keeps the top-1 weight differentiable.
@@ -85,5 +84,38 @@ class ConvMoE(nn.Module):
         for index, expert in enumerate(self.experts):
             weights = routing_weights[:, index, None, None, None].to(mixed.dtype)
             mixed = mixed + weights * expert(features)
-        delta = self.up(F.gelu(mixed)).flatten(2).transpose(1, 2)
+        return mixed, probabilities, routing_weights
+
+    def forward(self, spatial_tokens, spatial_shape):
+        height, width = spatial_shape
+        if self.pixel_patch_size is None:
+            batch, patch_count, channels = spatial_tokens.shape
+            if min(batch, height, width) < 1 or patch_count != height * width:
+                raise ValueError(f"Visual token shape {spatial_tokens.shape} does not match grid {spatial_shape}")
+
+            grid = spatial_tokens.transpose(1, 2).reshape(batch, channels, height, width)
+            mixed, probabilities, routing_weights = self._mix_experts(grid)
+            patch_features = F.gelu(mixed)
+        else:
+            patch_size = self.pixel_patch_size
+            expected_shape = (3, height * patch_size, width * patch_size)
+            if (spatial_tokens.ndim != 4 or min(spatial_tokens.shape[0], height, width) < 1
+                    or spatial_tokens.shape[1:] != expected_shape):
+                raise ValueError(f"Expected RGB shape [B, {expected_shape[0]}, {expected_shape[1]}, "
+                                 f"{expected_shape[2]}] for patch grid {spatial_shape}, got {spatial_tokens.shape}")
+
+            pooled_chunks, probability_chunks, routing_chunks = [], [], []
+            # Bound the full-resolution working set for large evaluation batches.
+            for images in spatial_tokens.split(8):
+                mixed, probabilities, routing_weights = self._mix_experts(images)
+                pooled_chunks.append(F.avg_pool2d(mixed.abs(), kernel_size=patch_size, stride=patch_size))
+                probability_chunks.append(probabilities)
+                routing_chunks.append(routing_weights)
+            patch_features = torch.cat(pooled_chunks, dim=0)
+            probabilities = torch.cat(probability_chunks, dim=0)
+            routing_weights = torch.cat(routing_chunks, dim=0)
+
+        importance = probabilities.mean(dim=0)
+        balance_loss = (len(self.experts) * importance - 1).square().mean()
+        delta = self.up(patch_features).flatten(2).transpose(1, 2)
         return delta.to(spatial_tokens.dtype), balance_loss, routing_weights.detach()

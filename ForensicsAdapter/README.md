@@ -139,16 +139,19 @@ in this version, so older detector checkpoints lack those learned projection wei
 | `off` | Uses the existing Adapter and supports checkpoints trained without MoE. |
 | `post_fusion` | Adds the MoE residual after block 3 and its CLIP fusion. DCT and MoE both read the same fused visual tokens when enabled together. |
 | `ffn` | Adds the MoE residual to visual tokens alongside the block 4 MLP after self-attention. |
+| `pixel` | Computes convolutional differences on the input RGB grid and adds a pooled texture residual to the visual tokens after block 4. |
 
-Both MoE placements use a shared convolution and route each image to CDC, ADC, or RDC. The
-default `conv_moe_top_k: 1` selects one expert with its probability from the full router softmax.
-Set `conv_moe_top_k: 2` to select two experts and normalize their weights over the selected pair.
-`conv_moe_balance_weight` controls the routing loss during training. Evaluation reports each
-expert's selection rate and mean weight across frames.
+All MoE modes use a shared convolution and route each image to CDC, ADC, or RDC. The default
+`conv_moe_top_k: 1` selects one expert with its probability from the full router softmax.
+The `pixel` mode uses Top-1 and averages the absolute mixed response within each 16-by-16
+pixel block before projecting to the Adapter's token width. The `post_fusion` and `ffn` modes
+also support `conv_moe_top_k: 2`. `conv_moe_balance_weight` controls the routing loss, and
+evaluation reports each expert's selection rate and mean weight across frames.
 
-For the placement comparison, train `off`, `post_fusion`, and `ffn` runs with
-`frequency_fusion: 'off'` and matching seeds and training schedules. To train the joint model,
-set `conv_moe_mode: 'ffn'` and `frequency_fusion: 'guided'`.
+For the pixel texture comparison, set `frequency_fusion: 'off'` and train `off`, `ffn`, and
+`pixel` runs with matching seeds and training schedules. In the joint model, use
+`conv_moe_mode: 'pixel'` with `frequency_fusion: 'guided'`. The DCT residual enters after block
+3 and the pixel texture residual enters after block 4.
 
 ## 📝 Citation
 

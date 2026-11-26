@@ -41,8 +41,8 @@ class Adapter(nn.Module):
     def __init__(self, vit_name, num_quires, fusion_map, mlp_dim, mlp_out_dim, head_num, device,
                  clip_dim, frequency_fusion="off", conv_moe_mode="off", conv_moe_top_k=1):
         super().__init__()
-        if conv_moe_mode not in ("off", "post_fusion", "ffn"):
-            raise ValueError(f"Invalid conv_moe_mode: {conv_moe_mode!r}. Expected off, post_fusion, or ffn.")
+        if conv_moe_mode not in ("off", "post_fusion", "ffn", "pixel"):
+            raise ValueError(f"Invalid conv_moe_mode: {conv_moe_mode!r}. Expected off, post_fusion, ffn, or pixel.")
         self.conv_moe_mode = conv_moe_mode
         self.device = device
         self.vit_model = create_model(vit_name,
@@ -82,7 +82,13 @@ class Adapter(nn.Module):
         if self.conv_moe_mode != "off":
             # Keep the initialization of later layers aligned across the ablations.
             with torch.random.fork_rng(devices=[]):
-                self.conv_moe = ConvMoE(self.num_features, top_k=conv_moe_top_k)
+                if self.conv_moe_mode == "pixel":
+                    self.conv_moe = ConvMoE(
+                        self.num_features, hidden_dim=8, top_k=conv_moe_top_k,
+                        pixel_patch_size=self.patch_conv.stride[0],
+                    )
+                else:
+                    self.conv_moe = ConvMoE(self.num_features, top_k=conv_moe_top_k)
 
     def fuse(self, block_idx, x, clip_features, spatial_shape):
         if str(block_idx) not in self.clip_fusions:
@@ -186,6 +192,11 @@ class Adapter(nn.Module):
                 aux_outputs.update(moe_balance=balance, moe_route_weights=weights)
             else:
                 x = block(x)  # (N, Q_L+L, D)
+            if i == 4 and self.conv_moe_mode == "pixel":
+                delta, balance, weights = self.conv_moe(image, (h, w))
+                visual = x[:, -v_L:] + delta.to(dtype=x.dtype)
+                x = torch.cat((x[:, :-v_L], visual), dim=1)
+                aux_outputs.update(moe_balance=balance, moe_route_weights=weights)
             x = self.fuse(i, x, clip_features, (h, w))
             if i == 3 and (self.frequency_fusion is not None or self.conv_moe_mode == "post_fusion"):
                 fused_visual = x[:, -v_L:]

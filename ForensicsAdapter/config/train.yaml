@@ -19,8 +19,8 @@ clip_model_name: "ViT-L/14"
 # Path to the CLIP cache on the training machine (null uses the default cache).
 clip_download_root: null
 frequency_fusion: guided  # off, absolute, uniform, guided
-conv_moe_mode: 'off'  # off, post_fusion, ffn
-conv_moe_top_k: 1  # routed experts per image, in addition to the shared convolution (1 or 2)
+conv_moe_mode: 'off'  # off, post_fusion, ffn, pixel
+conv_moe_top_k: 1  # pixel uses 1; post_fusion and ffn support 1 or 2
 conv_moe_balance_weight: 0.01
 #clip_model_name: "ViT-B/16"
 

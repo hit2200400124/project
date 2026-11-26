@@ -17,7 +17,7 @@ fusion_map: {0: 0, 1: 1, 2: 8, 3: 15}
 clip_model_name: "ViT-L/14"
 clip_download_root: null
 frequency_fusion: guided  # match the training run
-conv_moe_mode: 'off'  # match the training run
+conv_moe_mode: 'off'  # off, post_fusion, ffn, pixel; match the training run
 conv_moe_top_k: 1  # match the training run
 #clip_model_name: "ViT-B/16"
 
